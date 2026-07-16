@@ -12,7 +12,9 @@
                 "src/amazon-ivs-worker.min.js",
                 "src/app.js",
                 "src/chrome/app.js",
-                "src/download.js"
+                "src/download.js",
+                "src/hls.min.js",
+                "src/rewind.js"
             ],
             "matches": [
                 "https://*.twitch.tv/*"

@@ -9,7 +9,10 @@
     "web_accessible_resources": [
         "src/firefox/app.js",
         "src/app.js",
-        "src/patch_amazonworker.js"
+        "src/patch_amazonworker.js",
+        "src/download.js",
+        "src/hls.min.js",
+        "src/rewind.js"
     ],
     "content_scripts": [
         {
