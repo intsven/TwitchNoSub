@@ -11,6 +11,12 @@
     let rewindStylesInjected = false;
     let rewindFullscreenHandler = null;
 
+    let liveHls = null;
+    let liveVideoEl = null;
+    let liveVideoWrapper = null;
+    let liveEdgeTime = null;
+    let transitionToLivePending = false;
+
     const RESERVED_PATHS = new Set([
         "directory", "settings", "subscriptions", "wallet", "drops", "friends",
         "inventory", "videos", "downloads", "turbo", "payments", "p", "moderator",
@@ -186,6 +192,13 @@
             .tns-rewind-quality-item { padding: 6px 12px; color: #efeff1; font-size: 13px; cursor: pointer; white-space: nowrap; }
             .tns-rewind-quality-item:hover { background: rgba(255,255,255,0.1); }
             .tns-rewind-quality-item.tns-active { color: #a970ff; }
+            .tns-live-badge {
+                position: absolute; top: 10px; right: 10px; z-index: 10000;
+                background: #e91919; color: #fff; font-size: 12px; font-weight: 700;
+                padding: 3px 8px; border-radius: 3px; letter-spacing: 0.5px;
+                opacity: 0; transition: opacity 0.3s ease; pointer-events: none;
+            }
+            .tns-live-badge.tns-visible { opacity: 1; }
         `;
         document.head.appendChild(style);
     }
@@ -394,7 +407,105 @@
         showControls();
     }
 
+    function destroyLiveBuffer() {
+        if (liveHls) {
+            liveHls.destroy();
+            liveHls = null;
+        }
+        if (liveVideoWrapper) {
+            liveVideoWrapper.remove();
+            liveVideoWrapper = null;
+        }
+        liveVideoEl = null;
+        liveEdgeTime = null;
+        transitionToLivePending = false;
+    }
+
+    function startLiveBuffer(streamUrl, videoWrap, vodVideo, overlay) {
+        liveVideoWrapper = document.createElement('div');
+        liveVideoWrapper.className = 'tns-rewind-video-wrap';
+        liveVideoWrapper.style.opacity = '0';
+        liveVideoWrapper.style.transition = 'opacity 0.5s ease';
+        liveVideoWrapper.style.position = 'absolute';
+        liveVideoWrapper.style.inset = '0';
+        liveVideoWrapper.style.zIndex = '1';
+
+        liveVideoEl = document.createElement('video');
+        liveVideoEl.className = 'tns-rewind-video';
+        liveVideoEl.muted = true;
+        liveVideoEl.playsInline = true;
+
+        liveVideoWrapper.appendChild(liveVideoEl);
+        videoWrap.insertBefore(liveVideoWrapper, videoWrap.firstChild);
+
+        const liveBadge = document.createElement('div');
+        liveBadge.className = 'tns-live-badge';
+        liveBadge.textContent = 'LIVE';
+        liveVideoWrapper.appendChild(liveBadge);
+
+        liveHls = new window.Hls({
+            liveSyncDurationCount: 3,
+            liveMaxLatencyDurationCount: 6,
+            liveDurationInfinity: true,
+            lowLatencyMode: true,
+            maxBufferLength: 20,
+            maxMaxBufferLength: 20
+        });
+
+        liveHls.loadSource(streamUrl);
+        liveHls.attachMedia(liveVideoEl);
+
+        liveHls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+            liveVideoEl.play().catch(() => {});
+        });
+
+        liveHls.on(window.Hls.Events.ERROR, (event, data) => {
+            if (data.fatal) {
+                console.error("[TNS] Live buffer fatal error:", data);
+            }
+        });
+
+        liveHls.on(window.Hls.Events.BUFFER_APPENDED, () => {
+            if (liveVideoEl) {
+                const buffered = liveVideoEl.buffered;
+                if (buffered.length > 0) {
+                    liveEdgeTime = buffered.end(buffered.length - 1);
+                }
+            }
+        });
+
+        function transitionToLive() {
+            if (transitionToLivePending) return;
+            transitionToLivePending = true;
+
+            vodVideo.pause();
+            liveVideoEl.muted = false;
+            liveVideoWrapper.style.opacity = '1';
+            vodVideo.style.opacity = '0';
+            liveBadge.classList.add('tns-visible');
+
+            if (liveVideoEl.paused) {
+                liveVideoEl.play().catch(() => {});
+            }
+
+            vodVideo.removeEventListener('timeupdate', checkLiveTransition);
+        }
+
+        function checkLiveTransition() {
+            if (!liveVideoEl || !vodVideo.duration) return;
+
+            const timeUntilEnd = vodVideo.duration - vodVideo.currentTime;
+            if (timeUntilEnd < 15) {
+                transitionToLive();
+            }
+        }
+
+        vodVideo.addEventListener('timeupdate', checkLiveTransition);
+        vodVideo.addEventListener('ended', transitionToLive);
+    }
+
     function closeRewindOverlay() {
+        destroyLiveBuffer();
         if (rewindOverlayInterval) {
             clearInterval(rewindOverlayInterval);
             rewindOverlayInterval = null;
@@ -418,7 +529,7 @@
         }
     }
 
-    async function openRewindOverlay(vodId) {
+    async function openRewindOverlay(vodId, channelLogin) {
         closeRewindOverlay();
 
         const container = getPlayerContainer();
@@ -535,6 +646,55 @@
 
         statusText.style.display = 'none';
         buildRewindControls(overlay, videoWrap, video, backButton);
+
+        startLiveBufferForRewind(channelLogin, videoWrap, video, overlay);
+    }
+
+    async function getLiveStreamUrl(channelLogin) {
+        try {
+            const resp = await fetch("https://gql.twitch.tv/gql", {
+                method: 'POST',
+                body: JSON.stringify({
+                    "query": `query { user(login: "${channelLogin}") { stream { id } } }`
+                }),
+                headers: {
+                    'Client-Id': 'kimne78kx3ncx6brgo4mv6wki5h1ko',
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                }
+            });
+            const data = await resp.json();
+            const stream = data?.data?.user?.stream;
+            if (!stream) return null;
+
+            const tokenResp = await fetch("https://gql.twitch.tv/gql", {
+                method: 'POST',
+                body: JSON.stringify({
+                    "query": `query { streamPlaybackAccessToken(channelName: "${channelLogin}", platform: "web") { value signature } }`
+                }),
+                headers: {
+                    'Client-Id': 'kimne78kx3ncx6brgo4mv6wki5h1ko',
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                }
+            });
+            const tokenData = await tokenResp.json();
+            const token = tokenData?.data?.streamPlaybackAccessToken;
+            if (!token) return null;
+
+            const tokenValue = encodeURIComponent(token.value);
+            const tokenSig = token.signature;
+            return `https://usher.ttvnw.net/api/channel/hls/${channelLogin}.m3u8?allow_source=true&allow_audio_only=true&fast_bread=true&p=${Math.floor(Math.random() * 1e7)}&player_backend=mediaplayer&sig=${tokenSig}&token=${tokenValue}`;
+        } catch (e) {
+            console.error("[TNS] Failed to get live stream URL:", e);
+            return null;
+        }
+    }
+
+    async function startLiveBufferForRewind(channelLogin, videoWrap, vodVideo, overlay) {
+        const streamUrl = await getLiveStreamUrl(channelLogin);
+        if (!streamUrl || rewindOverlay !== overlay) return;
+        startLiveBuffer(streamUrl, videoWrap, vodVideo, overlay);
     }
 
     function createRewindButton() {
@@ -579,7 +739,7 @@
                 rewindButton.title = 'Rewind: watch from the beginning';
 
                 rewindButton.addEventListener('click', () => {
-                    openRewindOverlay(vodId);
+                    openRewindOverlay(vodId, channelLogin);
                 });
             } else {
                 rewindButton.title = 'Rewind unavailable (VODs not enabled for this channel)';
