@@ -237,7 +237,7 @@
         const muteBtn = document.createElement('button');
         muteBtn.className = 'tns-rewind-btn';
         muteBtn.innerHTML = VOLUME_ICON;
-        muteBtn.title = 'Couper le son';
+        muteBtn.title = 'Mute';
         muteBtn.addEventListener('click', () => {
             video.muted = !video.muted;
         });
@@ -274,7 +274,7 @@
         const qualityBtn = document.createElement('button');
         qualityBtn.className = 'tns-rewind-btn';
         qualityBtn.innerHTML = SETTINGS_ICON;
-        qualityBtn.title = 'Qualité';
+        qualityBtn.title = 'Quality';
 
         const qualityMenu = document.createElement('div');
         qualityMenu.className = 'tns-rewind-quality-menu';
@@ -293,7 +293,7 @@
         const fullscreenBtn = document.createElement('button');
         fullscreenBtn.className = 'tns-rewind-btn';
         fullscreenBtn.innerHTML = FULLSCREEN_ICON;
-        fullscreenBtn.title = 'Plein écran';
+        fullscreenBtn.title = 'Fullscreen';
         fullscreenBtn.addEventListener('click', () => {
             if (document.fullscreenElement) {
                 document.exitFullscreen();
@@ -318,7 +318,7 @@
         videoWrap.appendChild(controls);
 
         video.addEventListener('play', () => { playBtn.innerHTML = PAUSE_ICON; playBtn.title = 'Pause'; });
-        video.addEventListener('pause', () => { playBtn.innerHTML = PLAY_ICON; playBtn.title = 'Lecture'; showControls(); });
+        video.addEventListener('pause', () => { playBtn.innerHTML = PLAY_ICON; playBtn.title = 'Play'; showControls(); });
         video.addEventListener('volumechange', () => {
             muteBtn.innerHTML = (video.muted || video.volume === 0) ? MUTE_ICON : VOLUME_ICON;
             volumeSlider.value = String(video.muted ? 0 : video.volume);
@@ -356,7 +356,7 @@
 
                 makeItem('Auto', () => { rewindHls.currentLevel = -1; }, rewindHls.currentLevel === -1);
                 levels.forEach((level, index) => {
-                    const label = level.height ? `${level.height}p` : `Niveau ${index + 1}`;
+                    const label = level.height ? `${level.height}p` : `Level ${index + 1}`;
                     makeItem(label, () => { rewindHls.currentLevel = index; }, rewindHls.currentLevel === index);
                 });
             };
@@ -437,7 +437,7 @@
         overlay.style.backgroundColor = '#000';
 
         const statusText = document.createElement('div');
-        statusText.textContent = 'Chargement du rewind...';
+        statusText.textContent = 'Loading rewind...';
         statusText.style.position = 'absolute';
         statusText.style.top = '50%';
         statusText.style.left = '50%';
@@ -449,7 +449,7 @@
         statusText.style.zIndex = '10';
 
         const backButton = document.createElement('button');
-        backButton.textContent = '← Retour au direct';
+        backButton.textContent = '← Back to live';
         backButton.style.position = 'absolute';
         backButton.style.top = '10px';
         backButton.style.left = '10px';
@@ -489,7 +489,7 @@
         } catch (e) {
             console.error("[TNS] Failed to prepare rewind playback:", e);
             if (rewindOverlay === overlay) {
-                statusText.textContent = 'Erreur lors du chargement du rewind.';
+                statusText.textContent = 'Failed to load rewind.';
             }
             return;
         }
@@ -497,7 +497,7 @@
         if (rewindOverlay !== overlay) return; // overlay was closed while loading
 
         if (!manifestUrl) {
-            statusText.textContent = "Rewind indisponible pour le moment (VOD pas encore prête, réessayez dans quelques instants).";
+            statusText.textContent = "Rewind not available yet (VOD not ready, try again in a few moments).";
             return;
         }
 
@@ -519,7 +519,7 @@
             hls.on(window.Hls.Events.ERROR, (event, data) => {
                 if (data.fatal && rewindOverlay === overlay) {
                     console.error("[TNS] HLS fatal error:", data);
-                    statusText.textContent = 'Erreur de lecture du rewind.';
+                    statusText.textContent = 'Playback error.';
                     statusText.style.display = 'block';
                 }
             });
@@ -529,7 +529,7 @@
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = manifestUrl;
         } else {
-            statusText.textContent = "Votre navigateur ne supporte pas la lecture du rewind.";
+            statusText.textContent = "Your browser does not support rewind playback.";
             return;
         }
 
@@ -562,7 +562,7 @@
         rewindButton.style.marginLeft = '10px';
         rewindButton.style.opacity = '0.4';
         rewindButton.style.cursor = 'default';
-        rewindButton.title = 'Rewind: vérification en cours...';
+        rewindButton.title = 'Rewind: checking...';
         rewindButton.disabled = true;
 
         controlsContainer.appendChild(rewindButton);
@@ -576,13 +576,13 @@
                 rewindButton.style.opacity = '1';
                 rewindButton.style.cursor = 'pointer';
                 rewindButton.disabled = false;
-                rewindButton.title = 'Rewind: revoir le direct depuis le début';
+                rewindButton.title = 'Rewind: watch from the beginning';
 
                 rewindButton.addEventListener('click', () => {
                     openRewindOverlay(vodId);
                 });
             } else {
-                rewindButton.title = 'Rewind indisponible (le streamer n\'a pas activé les VODs pour cette chaîne)';
+                rewindButton.title = 'Rewind unavailable (VODs not enabled for this channel)';
             }
         });
 
