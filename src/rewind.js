@@ -16,6 +16,9 @@
     let liveVideoWrapper = null;
     let liveEdgeTime = null;
     let transitionToLivePending = false;
+    let vodTailPdt = null;
+    let vodManifestUrl = null;
+    let liveMediaPlaylistUrl = null;
 
     const RESERVED_PATHS = new Set([
         "directory", "settings", "subscriptions", "wallet", "drops", "friends",
@@ -106,6 +109,144 @@
             return `https://${domain}/${vodSpecialID}/chunked/index-dvr.m3u8`;
         } catch (e) {
             console.error("[TNS] Error resolving rewind manifest:", e);
+            return null;
+        }
+    }
+
+    // Twitch serves the recording in more than one playlist flavour:
+    //   * some VODs tag every segment with EXT-X-PROGRAM-DATE-TIME
+    //   * others carry a single ID3-EQUIV-TDTG (stream start time) plus
+    //     EXT-X-TWITCH-ELAPSED-SECS and no PDT at all
+    // Normalise both into per-segment epoch-ms `pdt`, falling back to
+    // TDTG + elapsed offset. Yields null `pdt` only when neither is present.
+    function parseMediaPlaylist(text, baseUrl) {
+        const lines = text.split('\n');
+        const segments = [];
+
+        let currentPdt = null;
+        let pendingDuration = 0;
+        let elapsed = 0;
+        let tdtg = null;
+        let totalSecs = null;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line) continue;
+
+            if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+                const parsed = Date.parse(line.slice('#EXT-X-PROGRAM-DATE-TIME:'.length).trim());
+                currentPdt = isNaN(parsed) ? null : parsed;
+                continue;
+            }
+
+            // Wall-clock origin for playlists that omit PDT. Twitch writes the
+            // playlist's generation time here, not the stream's start, so the
+            // base is TDTG minus the total duration the VOD will reach.
+            if (line.startsWith('#ID3-EQUIV-TDTG:')) {
+                const value = line.slice('#ID3-EQUIV-TDTG:'.length).trim();
+                // A value with no zone designator is UTC by spec. Appending "Z"
+                // avoids Date.parse silently treating it as local time, which
+                // would shift every derived segment time by the local offset.
+                const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+                const parsed = Date.parse(hasZone ? value : value + 'Z');
+                if (!isNaN(parsed)) tdtg = parsed;
+                continue;
+            }
+
+            if (line.startsWith('#EXT-X-TWITCH-TOTAL-SECS:')) {
+                const v = parseFloat(line.slice('#EXT-X-TWITCH-TOTAL-SECS:'.length));
+                if (!isNaN(v)) totalSecs = v;
+                continue;
+            }
+
+            if (line.startsWith('#EXT-X-TWITCH-ELAPSED-SECS:')) {
+                const v = parseFloat(line.slice('#EXT-X-TWITCH-ELAPSED-SECS:'.length));
+                if (!isNaN(v)) elapsed = v;
+                continue;
+            }
+
+            // EXTINF precedes the segment it describes, so hold it until the
+            // segment line is seen.
+            if (line.startsWith('#EXTINF:')) {
+                const dur = parseFloat(line.slice('#EXTINF:'.length));
+                pendingDuration = isNaN(dur) ? 0 : dur;
+                continue;
+            }
+
+            if (line.startsWith('#')) continue;
+
+            // Prefer explicit PDT; otherwise derive it from the TDTG base plus
+            // this segment's offset from the start of the recording.
+            const derived = tdtg !== null
+                ? tdtg - (totalSecs !== null ? totalSecs * 1000 : 0) + elapsed * 1000
+                : null;
+
+            segments.push({
+                url: new URL(line, baseUrl).href,
+                pdt: currentPdt !== null ? currentPdt : derived,
+                duration: pendingDuration
+            });
+
+            // A tag only applies to the segment it immediately precedes.
+            currentPdt = null;
+            elapsed += pendingDuration;
+            pendingDuration = 0;
+        }
+
+        return segments;
+    }
+
+    async function fetchPlaylistSegments(url) {
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) return null;
+            const text = await resp.text();
+            return parseMediaPlaylist(text, url);
+        } catch (e) {
+            console.error("[TNS] Failed to parse playlist:", url, e);
+            return null;
+        }
+    }
+
+    // The VOD's last PDT is the wall-clock instant the recording has reached.
+    // Everything the live stream carries after that instant is the part we can
+    // hand over to without a gap.
+    async function getVodTailPdt(manifestUrl) {
+        const segments = await fetchPlaylistSegments(manifestUrl);
+        if (!segments || segments.length === 0) return null;
+
+        const timed = segments.filter((s) => s.pdt !== null);
+        if (timed.length === 0) return null;
+
+        return timed[timed.length - 1].pdt + (timed[timed.length - 1].duration || 0) * 1000;
+    }
+
+    // usher returns a MASTER playlist pointing at per-quality media playlists.
+    // We need the actual media playlist to read PDT from it.
+    async function resolveLiveMediaPlaylist(masterUrl) {
+        try {
+            const resp = await fetch(masterUrl);
+            if (!resp.ok) return null;
+            const text = await resp.text();
+
+            const lines = text.split('\n');
+            const variants = lines.filter((l) => l && !l.startsWith('#'));
+            if (variants.length === 0) return null;
+
+            const withBandwidth = [];
+            for (let i = 0; i < lines.length; i++) {
+                if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+                const bwMatch = lines[i].match(/BANDWIDTH=(\d+)/);
+                const next = lines.slice(i + 1).find((l) => l && !l.startsWith('#'));
+                if (!next) continue;
+                withBandwidth.push({ url: new URL(next, masterUrl).href, bw: bwMatch ? parseInt(bwMatch[1], 10) : 0 });
+            }
+
+            // Prefer the highest-bandwidth rendition we can decode (source).
+            withBandwidth.sort((a, b) => b.bw - a.bw);
+            return withBandwidth.length ? withBandwidth[0].url : new URL(variants[0], masterUrl).href;
+        } catch (e) {
+            console.error("[TNS] Failed to resolve live media playlist:", e);
             return null;
         }
     }
@@ -419,6 +560,67 @@
         liveVideoEl = null;
         liveEdgeTime = null;
         transitionToLivePending = false;
+        vodTailPdt = null;
+        vodManifestUrl = null;
+        liveMediaPlaylistUrl = null;
+    }
+
+    // Convert a wall-clock instant into a position inside the live stream's
+    // current DVR window, so playback can resume exactly where the VOD stopped.
+    async function seekLiveToPdt(targetPdtMs) {
+        if (!liveMediaPlaylistUrl || !liveVideoEl) return false;
+
+        const segments = await fetchPlaylistSegments(liveMediaPlaylistUrl);
+        if (!segments || segments.length === 0) return false;
+
+        const timed = segments.filter((s) => s.pdt !== null);
+        if (timed.length === 0) return false;
+
+        // hls.js exposes the live window as a 0-based timeline, so the offset
+        // from the first segment's PDT is the position to seek to.
+        const windowStart = timed[0].pdt;
+        const last = timed[timed.length - 1];
+        const windowEnd = last.pdt + (last.duration || 0) * 1000;
+
+        const offset = Math.max(0, (targetPdtMs - windowStart) / 1000);
+        const windowDuration = (windowEnd - windowStart) / 1000;
+
+        // Only claim a gapless join when the target really sits inside the live
+        // window; otherwise fall back to the live edge.
+        if (offset > windowDuration) {
+            console.warn(
+                `[TNS] PDT target outside live window (${offset.toFixed(1)}s > ${windowDuration.toFixed(1)}s), using live edge`
+            );
+            return false;
+        }
+
+        // Clamp into the range that is actually still buffered. hls.js evicts
+        // data behind the playhead as a live stream advances, so the playable
+        // window can be far shorter than the playlist window: seeking below
+        // buffered.start lands in an evicted hole and the element stalls with
+        // readyState HAVE_NOTHING. Also keep a margin off the newest segment,
+        // which may still be decoding.
+        const buffered = liveVideoEl.buffered;
+        const bufferedStart = buffered.length ? buffered.start(0) : 0;
+        const bufferedEnd = buffered.length ? buffered.end(buffered.length - 1) : 0;
+
+        const upperBound = Math.max(bufferedStart, bufferedEnd - 1);
+        const clamped = Math.min(Math.max(offset, bufferedStart), upperBound);
+
+        if (clamped !== offset) {
+            console.warn(
+                `[TNS] PDT target ${offset.toFixed(2)}s is outside the buffered range ` +
+                `[${bufferedStart.toFixed(2)}, ${bufferedEnd.toFixed(2)}], clamped to ${clamped.toFixed(2)}s`
+            );
+        }
+
+        console.log(
+            `[TNS] gapless seek: PDT offset ${offset.toFixed(2)}s -> live t=${clamped.toFixed(2)}s ` +
+            `(playlist window ${windowDuration.toFixed(1)}s, buffered [${bufferedStart.toFixed(2)}, ${bufferedEnd.toFixed(2)}])`
+        );
+
+        liveVideoEl.currentTime = clamped;
+        return clamped >= bufferedStart && clamped <= bufferedEnd;
     }
 
     function startLiveBuffer(streamUrl, videoWrap, vodVideo, overlay) {
@@ -452,10 +654,17 @@
             maxMaxBufferLength: 20
         });
 
+        // Load the media playlist (not the master) so we can read PDT from it.
+        resolveLiveMediaPlaylist(streamUrl).then((mediaUrl) => {
+            liveMediaPlaylistUrl = mediaUrl;
+        });
+
         liveHls.loadSource(streamUrl);
         liveHls.attachMedia(liveVideoEl);
 
         liveHls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+            // Buffer quietly in the background; stay muted until handover.
+            liveVideoEl.muted = true;
             liveVideoEl.play().catch(() => {});
         });
 
@@ -474,21 +683,67 @@
             }
         });
 
-        function transitionToLive() {
-            if (transitionToLivePending) return;
+        // The handover: pause the VOD, seek the live player to the exact
+        // wall-clock instant the VOD reached, then swap. Because both streams
+        // share the PDT axis this resumes on the same frame the VOD ended on,
+        // so there is no visible gap and no crossfade.
+        //
+        // The VOD tail is re-read here rather than cached at open time: the
+        // recording keeps growing and the live DVR window only retains a few
+        // seconds, so a timestamp captured minutes ago would fall outside it.
+        let switching = false;
+        async function transitionToLive() {
+            if (switching || transitionToLivePending) return;
+            if (!liveVideoEl) return;
+            switching = true;
             transitionToLivePending = true;
 
+            vodVideo.removeEventListener('timeupdate', checkLiveTransition);
+            vodVideo.removeEventListener('ended', transitionToLive);
+
             vodVideo.pause();
+
+            let target = vodTailPdt;
+            if (vodManifestUrl) {
+                try {
+                    const fresh = await getVodTailPdt(vodManifestUrl);
+                    if (fresh !== null) {
+                        target = fresh;
+                        vodTailPdt = fresh;
+                    }
+                } catch (e) {
+                    console.warn('[TNS] could not refresh VOD tail PDT:', e);
+                }
+            }
+
+            let gapless = false;
+            if (target !== null) {
+                try {
+                    gapless = await seekLiveToPdt(target);
+                } catch (e) {
+                    console.warn('[TNS] gapless seek failed:', e);
+                }
+            } else {
+                console.warn('[TNS] no VOD PDT available, falling back to live edge');
+            }
+
+            if (!gapless && liveVideoEl.buffered.length) {
+                // Fall back to the live edge so playback continues.
+                const buffered = liveVideoEl.buffered;
+                liveVideoEl.currentTime = Math.max(0, buffered.end(buffered.length - 1) - 0.5);
+            }
+
             liveVideoEl.muted = false;
             liveVideoWrapper.style.opacity = '1';
             vodVideo.style.opacity = '0';
             liveBadge.classList.add('tns-visible');
+            liveBadge.textContent = gapless ? 'LIVE' : 'LIVE (gap)';
 
-            if (liveVideoEl.paused) {
-                liveVideoEl.play().catch(() => {});
+            try {
+                await liveVideoEl.play();
+            } catch (e) {
+                console.warn('[TNS] live playback was blocked:', e);
             }
-
-            vodVideo.removeEventListener('timeupdate', checkLiveTransition);
         }
 
         function checkLiveTransition() {
@@ -611,6 +866,17 @@
             statusText.textContent = "Rewind not available yet (VOD not ready, try again in a few moments).";
             return;
         }
+
+        // Remember where the recording currently ends on the shared PDT axis so
+        // the live handover can resume on exactly that frame. This is a
+        // starting hint only - it is refreshed at handover time.
+        vodManifestUrl = manifestUrl;
+        getVodTailPdt(manifestUrl).then((pdt) => {
+            vodTailPdt = pdt;
+            if (pdt === null) {
+                console.warn('[TNS] VOD playlist had no PROGRAM-DATE-TIME; live handover will use the live edge');
+            }
+        });
 
         injectRewindStyles();
 
